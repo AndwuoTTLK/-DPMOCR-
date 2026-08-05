@@ -1,0 +1,28 @@
+工业点阵字 OCR 识别系统 - 运行说明
+
+一、环境要求
+1. Windows 10 / 11 64 位
+2. Python 3.12（64 位）
+
+二、源码运行方式
+1. 用 PyCharm / IDEA 打开本项目文件夹。
+2. 新建一个 Python 3.12 解释器（建议使用虚拟环境 .venv）。
+3. 在终端执行：
+   pip install -r requirements.txt
+4. 运行 main.py。
+
+也可以手动创建虚拟环境：
+1. python -m venv .venv
+2. .venv\Scripts\activate
+3. pip install -r requirements.txt
+4. python main.py
+
+三、绿色版运行方式
+将桌面上的“OCR v1.0”文件夹整体发给客户，客户解压后双击里面的
+“图像识别工具.exe”即可运行，无需安装 Python。
+
+四、注意事项
+1. model 文件夹是识别模型，不能删除或改名。
+2. debug_preprocess 文件夹会保存每次识别的中间过程和 result.txt。
+3. 图片中有二维码时，程序会优先识别二维码并直接输出二维码内容，
+   不再进行文字识别。
