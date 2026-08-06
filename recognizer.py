@@ -91,11 +91,12 @@ class ImageRecognizer:
         self._d = debug
         self._rt = _app_base() / "debug_preprocess"
         self._rn = None
-        # Load char classifier
-        self._cm = None; self._cc = None
-        self._load_char_model()
+        # 字符分类模型按需懒加载
+        self._cm = None; self._cc = None; self._pmx = None
+        self._char_loaded = False
         self._rec6 = None
         self._wq = None
+        self._qrd = None
         self._det4 = None
 
     def _load_wechat_qr(self):
@@ -237,21 +238,35 @@ class ImageRecognizer:
         except Exception as e:
             print(f"[PP-OCRv6] Not available: {e}")
 
-    def _recognize_line_rec6(self, line):
+    def _recognize_lines_rec6(self, lines):
+        """批量识别文本行，返回 [(text, score), ...]，顺序与输入一致。"""
         if getattr(self, "_rec6", None) is None:
             self._load_rec6()
-        if self._rec6 is None or line is None or line.size == 0:
-            return "", 0.0
+        if self._rec6 is None:
+            return [("", 0.0) for _ in lines]
+        inputs = []
+        valid_idx = []
+        for i, line in enumerate(lines):
+            if line is None or line.size == 0:
+                continue
+            if line.shape[0] < PPOCRV6_REC_MIN_HEIGHT:
+                scale = max(1, int(np.ceil(PPOCRV6_REC_MIN_HEIGHT / line.shape[0])))
+                line = cv2.resize(line, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            inputs.append(cv2.cvtColor(line, cv2.COLOR_GRAY2RGB))
+            valid_idx.append(i)
+        pairs = [("", 0.0) for _ in lines]
+        if not inputs:
+            return pairs
         try:
-            gray = line
-            if gray.shape[0] < PPOCRV6_REC_MIN_HEIGHT:
-                scale = max(1, int(np.ceil(PPOCRV6_REC_MIN_HEIGHT / gray.shape[0])))
-                gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-            res = list(self._rec6.predict(input=rgb, batch_size=1))[0]
-            return str(res.get("rec_text", "")), float(res.get("rec_score", 0.0))
+            results = []
+            for res in self._rec6.predict(input=inputs, batch_size=min(8, len(inputs))):
+                results.append((str(res.get("rec_text", "")), float(res.get("rec_score", 0.0))))
+            if len(results) == len(valid_idx):
+                for i, pair in zip(valid_idx, results):
+                    pairs[i] = pair
         except Exception:
-            return "", 0.0
+            pass
+        return pairs
 
     def _load_char_model(self):
         try:
@@ -278,46 +293,67 @@ class ImageRecognizer:
             print(f"[CharCNN] Not available: {e}")
             self._cm = None
 
-    def _recognize_char(self, roi):
-        """单字分类：48x48 RGB /255。"""
-        if getattr(self, "_pmx", None) is not None:
+    def _ensure_char_model(self):
+        """字符分类模型首次使用时才加载，避免拖慢启动。"""
+        if self._char_loaded:
+            return
+        self._char_loaded = True
+        self._load_char_model()
+
+    def _recognize_chars(self, rois):
+        """批量识别单字 ROI，返回与输入等长的字符列表。"""
+        self._ensure_char_model()
+        if self._pmx is None and self._cm is None:
+            return ["?" for _ in rois]
+        inputs = [self._char_to_cls_input(r) for r in rois]
+        valid_idx = [i for i, inp in enumerate(inputs) if inp is not None]
+        chars = ["?" for _ in rois]
+        if self._pmx is not None and valid_idx:
             try:
-                inp = self._char_to_cls_input(roi)
-                if inp is not None:
-                    rgb = cv2.cvtColor(inp, cv2.COLOR_GRAY2RGB)
-                    res = list(self._pmx.predict(input=rgb, batch_size=1))[0]
-                    ids = [int(i) for i in res["class_ids"][0]]
-                    ink = float(np.count_nonzero(inp < 200)) / inp.size
-                    ch = None
-                    for i, idx in enumerate(ids):
-                        cand = self._cc[idx]
-                        if cand == "." and (i > 0 or ink > 0.02):
-                            continue
-                        ch = cand
-                        break
-                    if ch is None:
-                        ch = self._cc[ids[0]]
-                    return ch.upper() if OUTPUT_UPPERCASE else ch
+                batch = [cv2.cvtColor(inputs[i], cv2.COLOR_GRAY2RGB) for i in valid_idx]
+                for start in range(0, len(batch), 16):
+                    sub = batch[start:start + 16]
+                    res_list = list(self._pmx.predict(input=sub, batch_size=len(sub)))
+                    for vi, res in enumerate(res_list):
+                        idx = valid_idx[start + vi]
+                        ids = [int(i) for i in res["class_ids"][vi]]
+                        inp = inputs[idx]
+                        ink = float(np.count_nonzero(inp < 200)) / inp.size
+                        ch = None
+                        for pos, cid in enumerate(ids):
+                            cand = self._cc[cid]
+                            if cand == "." and (pos > 0 or ink > 0.02):
+                                continue
+                            ch = cand
+                            break
+                        if ch is None:
+                            ch = self._cc[ids[0]]
+                        chars[idx] = ch.upper() if OUTPUT_UPPERCASE else ch
+                return chars
             except Exception:
                 pass
-        if self._cm is None or self._cc is None:
-            return "?"
-        try:
-            import paddle
-            img = cv2.resize(roi, (48, 48), interpolation=cv2.INTER_CUBIC)
-            rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            arr = rgb.astype(np.float32) / 255.0
-            arr = arr.transpose(2, 0, 1)[None]
-            with paddle.no_grad():
-                logits = self._cm(paddle.to_tensor(arr))
-            return self._cc[int(paddle.argmax(logits, axis=1).numpy()[0])]
-        except:
-            return "?"
+        if self._cm is not None and self._cc is not None and valid_idx:
+            try:
+                import paddle
+                imgs = []
+                for i in valid_idx:
+                    img = cv2.resize(inputs[i], (48, 48), interpolation=cv2.INTER_CUBIC)
+                    rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                    imgs.append(rgb.astype(np.float32) / 255.0)
+                arr = np.stack(imgs).transpose(0, 3, 1, 2)
+                with paddle.no_grad():
+                    logits = self._cm(paddle.to_tensor(arr))
+                preds = paddle.argmax(logits, axis=1).numpy()
+                for vi, idx in enumerate(valid_idx):
+                    chars[idx] = self._cc[int(preds[vi])]
+            except Exception:
+                pass
+        return chars
 
     def _char_to_cls_input(self, roi, size=None, pad=4):
+        """把单字 ROI 归一化为白底黑字输入，和训练数据一致。"""
         if size is None:
             size = CLS_INPUT_SIZE
-        """把单字 ROI 归一化为白底黑字的 64x64 输入，和训练数据一致。"""
         if roi is None or roi.size == 0:
             return None
         norm = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -539,10 +575,27 @@ class ImageRecognizer:
         c=len([x for x in os.listdir(self._rt) if os.path.isdir(self._rt/x) and x.startswith(n)])
         self._rn=self._rt/f"{n}_{c+1:03d}"; os.makedirs(self._rn,exist_ok=True)
 
+    def _plain_qr(self):
+        if self._qrd is None:
+            self._qrd = cv2.QRCodeDetector()
+        return self._qrd
+
+    @staticmethod
+    def _scale_bbox(points, scale):
+        return [(int(x / scale), int(y / scale)) for x, y in points]
+
+    def _qr_results(self, texts, points, scale):
+        results = []
+        for i, t in enumerate(texts):
+            bbox = None
+            if points is not None and i < len(points):
+                bbox = self._scale_bbox(points[i].tolist(), scale)
+            results.append({"text": t, "bbox": bbox})
+        return results
+
     def recognize_qr(self, img):
         if getattr(self, "_wq", None) is None:
             self._load_wechat_qr()
-        results = []
         if self._wq is not None:
             for scale in (1, 2, 3):
                 v = img if scale == 1 else cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -550,15 +603,9 @@ class ImageRecognizer:
                     texts, points = self._wq.detectAndDecode(v)
                 except Exception:
                     continue
-                if not texts:
-                    continue
-                for i, t in enumerate(texts):
-                    bbox = None
-                    if points is not None and i < len(points):
-                        bbox = [(int(x / scale), int(y / scale)) for x, y in points[i].tolist()]
-                    results.append({"text": t, "bbox": bbox})
-                return results
-        d = cv2.QRCodeDetector()
+                if texts:
+                    return self._qr_results(texts, points, scale)
+        d = self._plain_qr()
         for scale in (1, 2):
             v = img if scale == 1 else cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             try:
@@ -566,15 +613,10 @@ class ImageRecognizer:
             except Exception:
                 continue
             if ok and data:
-                for i, t in enumerate(data):
-                    bbox = None
-                    if pts is not None and i < len(pts):
-                        bbox = [(int(x / scale), int(y / scale)) for x, y in pts[i].tolist()]
-                    results.append({"text": t, "bbox": bbox})
-                return results
-        # crop refinement: detected quad but no decode yet
+                return self._qr_results(data, pts, scale)
+        # 检测到四边形但未解码时，透视校正后放大再试
         try:
-            ret, pts = cv2.QRCodeDetector().detect(img)
+            ret, pts = d.detect(img)
             if ret:
                 for quad in pts:
                     q = quad.reshape(4, 2).astype(np.float32)
@@ -597,7 +639,7 @@ class ImageRecognizer:
                             except Exception:
                                 pass
                         try:
-                            ok, data, dpts, _ = cv2.QRCodeDetector().detectAndDecodeMulti(big)
+                            ok, data, dpts, _ = d.detectAndDecodeMulti(big)
                             if ok and data:
                                 bbox = [(int(x), int(y)) for x, y in q.tolist()]
                                 return [{"text": t, "bbox": bbox} for t in data]
@@ -873,6 +915,13 @@ class ImageRecognizer:
             out.append([y0, y1, x0, x1, c, t])
         return out
 
+    def _refine_rows(self, rows, gray, H):
+        """检测框的合并/过滤/拆行流水线，多尺度检测共用。"""
+        rows = self._merge_det_lines(rows)
+        rows = self._filter_merge_rows(rows, H)
+        rows = self._split_tall_rows(rows, gray, H)
+        return self._filter_merge_rows(rows, H)
+
     @staticmethod
     def _rectify_line(gray, box):
         """按检测框把文字行摆平并裁剪。"""
@@ -902,26 +951,17 @@ class ImageRecognizer:
         rgb=cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
         H,W=gray.shape
 
-        rows=self._det_lines4(rgb)
-        rows=self._merge_det_lines(rows)
-        rows=self._filter_merge_rows(rows,H)
-        rows=self._split_tall_rows(rows,gray,H)
-        rows=self._filter_merge_rows(rows,H)
+        rows = self._refine_rows(self._det_lines4(rgb), gray, H)
 
         # 不足 3 行时用放大图补充检测
-        if len(rows)<3:
-            for scale in (2.0, 1.5, 2.5):
+        if len(rows) < 3:
+            for scale in (2.0,):
                 big = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
                 for r in self._det_lines4(big):
                     r[0] = int(r[0] / scale); r[1] = int(r[1] / scale)
                     r[2] = int(r[2] / scale); r[3] = int(r[3] / scale)
                     rows.append(r)
-                rows = self._merge_det_lines(rows)
-                rows = self._filter_merge_rows(rows, H)
-                rows = self._split_tall_rows(rows, gray, H)
-                rows = self._filter_merge_rows(rows, H)
-                if len(rows) >= 3:
-                    break
+                rows = self._refine_rows(rows, gray, H)
             if len(rows) == 0:
                 enh = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
                 enh_rgb = cv2.cvtColor(enh, cv2.COLOR_GRAY2RGB)
@@ -930,10 +970,7 @@ class ImageRecognizer:
                     r[0] = int(r[0] / 2); r[1] = int(r[1] / 2)
                     r[2] = int(r[2] / 2); r[3] = int(r[3] / 2)
                     rows.append(r)
-                rows = self._merge_det_lines(rows)
-                rows = self._filter_merge_rows(rows, H)
-                rows = self._split_tall_rows(rows, gray, H)
-                rows = self._filter_merge_rows(rows, H)
+                rows = self._refine_rows(rows, gray, H)
         rows = self._filter_edge_rows(rows, W, H)
         rows = self._filter_main_rows(rows)
         rows.sort(key=lambda r:r[0])
@@ -946,16 +983,21 @@ class ImageRecognizer:
                 cv2.rectangle(v,(x0,y0),(x1,y1),(0,255,0),2)
             self._sv("lines","07_lines.png",v)
 
-        results=[]
-        all_texts=[]
-        for idx,(y0,y1,x0,x1,c,t) in enumerate(rows):
-            box=np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]],dtype=np.float32)
+        valid_rows = []
+        line_imgs = []
+        for idx, (y0, y1, x0, x1, c, t) in enumerate(rows):
+            box = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
             line, _ = self._rectify_line(gray, box)
-            if line is None or line.size==0:
+            if line is None or line.size == 0:
                 continue
-            self._sv("deskew",f"line{idx}.png",line)
+            self._sv("deskew", f"line{idx}.png", line)
+            valid_rows.append((idx, y0, y1, x0, x1))
+            line_imgs.append(line)
 
-            txt, conf = self._recognize_line_rec6(line)
+        line_pairs = self._recognize_lines_rec6(line_imgs)
+        results = []
+        all_texts = []
+        for (idx, y0, y1, x0, x1), line, (txt, conf) in zip(valid_rows, line_imgs, line_pairs):
             if not txt:
                 cc = self._split_chars(line)
                 if self._d:
@@ -963,16 +1005,19 @@ class ImageRecognizer:
                     for a, b, _, _ in cc:
                         cv2.rectangle(lv, (a, 0), (b, line.shape[0]), (0, 255, 0), 1)
                     self._sv("split", f"line{idx}_chars.png", lv)
-                txt = ""
+                rois = []
                 for ci, (a, b, cy0, cy1) in enumerate(cc):
                     roi = line[cy0:cy1 + 1, a:b + 1]
-                    if roi.size == 0: continue
+                    if roi.size == 0:
+                        rois.append(None)
+                        continue
                     self._sv("chars", f"l{idx}c{ci}.png", roi)
-                    txt += self._recognize_char(roi)
+                    rois.append(roi)
+                txt = "".join(self._recognize_chars(rois))
                 conf = 1.0
             txt = self._postprocess_text(txt)
             if txt:
-                results.append({"text":txt,"confidence":float(conf),"bbox":[[x0,y0],[x1,y0],[x1,y1],[x0,y1]]})
+                results.append({"text": txt, "confidence": float(conf), "bbox": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]})
                 all_texts.append(txt)
 
         self._save_result(all_texts)
@@ -1126,10 +1171,10 @@ class ImageRecognizer:
             lines = self._small_det_lines(image)
         if not lines:
             lines = self._small_component_rows(gray)
+        line_pairs = self._recognize_lines_rec6(lines)
         results = []
-        for idx, line in enumerate(lines):
+        for idx, (line, (txt, conf)) in enumerate(zip(lines, line_pairs)):
             self._sv("small", f"line{idx}.png", line)
-            txt, conf = self._recognize_line_rec6(line)
             txt = self._postprocess_text(txt)
             if txt:
                 results.append({"text": txt, "confidence": float(conf), "bbox": None})
