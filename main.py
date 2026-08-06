@@ -27,6 +27,7 @@ class App(tk.Tk):
         self.current_image_bgr = None
         self.current_results = None
         self.display_photo = None
+        self._busy = False
         self._build_ui()
         self._setup_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -110,6 +111,10 @@ class App(tk.Tk):
         self._process_image_array(image_bgr, os.path.basename(path))
 
     def _process_image_array(self, image_bgr, label="image"):
+        if self._busy:
+            self.status_var.set("正在识别，请稍候")
+            return
+        self._busy = True
         self.current_image_bgr = image_bgr
         self._display_image(image_bgr)
         self.status_var.set(f"[{label}] 正在识别...")
@@ -130,6 +135,11 @@ class App(tk.Tk):
                 f.write(f"\nError: {e}")
             self.after(0, lambda: messagebox.showerror("识别失败", f"错误已保存到:\n{log_path}"))
             self.after(0, lambda: self.status_var.set("识别失败"))
+        finally:
+            self.after(0, self._finish_busy)
+
+    def _finish_busy(self):
+        self._busy = False
 
     def _show_recognition_results(self, results):
         self.current_results = results

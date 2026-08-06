@@ -129,6 +129,7 @@ class ImageRecognizer:
             print("[PP-OCRv4-det] loaded")
         except Exception as e:
             print(f"[PP-OCRv4-det] Not available: {e}")
+            self._diag(f"[load_det4] {e!r}")
 
     def _det_lines4(self, rgb):
         """微调后的 PP-OCRv4 检测文字行，返回 [y0,y1,x0,x1,score,text] 列表。"""
@@ -155,7 +156,7 @@ class ImageRecognizer:
                     float(sc), "",
                 ])
         except Exception:
-            pass
+            self._diag("[det_lines4] predict failed")
         return rows
 
     @staticmethod
@@ -237,6 +238,7 @@ class ImageRecognizer:
             print("[PP-OCRv6] loaded")
         except Exception as e:
             print(f"[PP-OCRv6] Not available: {e}")
+            self._diag(f"[load_rec6] {e!r}")
 
     def _recognize_lines_rec6(self, lines):
         """批量识别文本行，返回 [(text, score), ...]，顺序与输入一致。"""
@@ -259,13 +261,13 @@ class ImageRecognizer:
             return pairs
         try:
             results = []
-            for res in self._rec6.predict(input=inputs, batch_size=min(8, len(inputs))):
+            for res in self._rec6.predict(input=inputs, batch_size=min(4, len(inputs))):
                 results.append((str(res.get("rec_text", "")), float(res.get("rec_score", 0.0))))
             if len(results) == len(valid_idx):
                 for i, pair in zip(valid_idx, results):
                     pairs[i] = pair
         except Exception:
-            pass
+            self._diag("[recognize_lines_rec6] predict failed")
         return pairs
 
     def _load_char_model(self):
@@ -280,6 +282,7 @@ class ImageRecognizer:
             return
         except Exception as e:
             print(f"[PaddleX-ResNet18] Not available: {e}")
+            self._diag(f"[load_char_pmx] {e!r}")
             self._pmx = None
         try:
             import paddle, json
@@ -291,6 +294,7 @@ class ImageRecognizer:
             print(f"[CharCNN] loaded, {len(self._cc)} classes")
         except Exception as e:
             print(f"[CharCNN] Not available: {e}")
+            self._diag(f"[load_char_cnn] {e!r}")
             self._cm = None
 
     def _ensure_char_model(self):
@@ -311,8 +315,8 @@ class ImageRecognizer:
         if self._pmx is not None and valid_idx:
             try:
                 batch = [cv2.cvtColor(inputs[i], cv2.COLOR_GRAY2RGB) for i in valid_idx]
-                for start in range(0, len(batch), 16):
-                    sub = batch[start:start + 16]
+                for start in range(0, len(batch), 8):
+                    sub = batch[start:start + 8]
                     res_list = list(self._pmx.predict(input=sub, batch_size=len(sub)))
                     for vi, res in enumerate(res_list):
                         idx = valid_idx[start + vi]
@@ -568,6 +572,17 @@ class ImageRecognizer:
         p = self._rn / "result.txt"
         with open(p, "w", encoding="utf-8") as f:
             f.write("\n".join(texts))
+
+    def _diag(self, msg):
+        """把被吞掉的模型/推理错误追加到 debug 目录，方便排查空识别结果。"""
+        if not self._d:
+            return
+        try:
+            self._rt.mkdir(exist_ok=True)
+            with open(self._rt / "diag.txt", "a", encoding="utf-8") as f:
+                f.write(f"{msg}\n")
+        except Exception:
+            pass
 
     def _bg(self, n="img"):
         if not self._d: return
@@ -975,6 +990,7 @@ class ImageRecognizer:
         rows = self._filter_main_rows(rows)
         rows.sort(key=lambda r:r[0])
         if not rows:
+            self._diag(f"[recognize_text] no rows, det4={'ok' if self._det4 is not None else 'None'}")
             return []
 
         if self._d:
@@ -1171,6 +1187,8 @@ class ImageRecognizer:
             lines = self._small_det_lines(image)
         if not lines:
             lines = self._small_component_rows(gray)
+        if not lines:
+            self._diag(f"[recognize_small_text] no lines, det4={'ok' if self._det4 is not None else 'None'}, rec6={'ok' if self._rec6 is not None else 'None'}")
         line_pairs = self._recognize_lines_rec6(lines)
         results = []
         for idx, (line, (txt, conf)) in enumerate(zip(lines, line_pairs)):

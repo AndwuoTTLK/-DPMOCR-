@@ -4,3 +4,7 @@ __pycache__/
 .idea/
 *.iml
 debug_preprocess/
+build/
+dist/
+build_log*.txt
+pkg_test_screenshot.jpg
