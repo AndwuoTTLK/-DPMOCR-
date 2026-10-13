@@ -4,7 +4,7 @@ import sysconfig
 import pkgutil
 from pathlib import Path
 
-datas = [('model', 'model')]
+datas = [('model', 'model'), ('图标文件.ico', '.'), ('DPMOCR.ico', '.')]
 binaries = []
 
 # 把整个 site-packages 原样复制进 _internal，运行时直接从包内 import。
@@ -79,7 +79,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['图标文件.ico'],
+    icon=['DPMOCR.ico'],
 )
 coll = COLLECT(
     exe,

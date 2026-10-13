@@ -1,28 +1,46 @@
-工业点阵字 OCR 识别系统 - 运行说明
+DPMOCR 运行说明
 
-一、环境要求
-1. Windows 10 / 11 64 位
-2. Python 3.12（64 位）
+项目目录：D:\RQment\WORD\毕业论文\-DPMOCR-
+系统要求：Windows 10/11（64 位）、Python 3.12（64 位）
 
-二、源码运行方式
-1. 用 PyCharm / IDEA 打开本项目文件夹。
-2. 新建一个 Python 3.12 解释器（建议使用虚拟环境 .venv）。
-3. 在终端执行：
-   pip install -r requirements.txt
-4. 运行 main.py。
+一、准备环境
+在 PowerShell 中进入项目目录：
+  Set-Location -LiteralPath "D:\RQment\WORD\毕业论文\-DPMOCR-"
 
-也可以手动创建虚拟环境：
-1. python -m venv .venv
-2. .venv\Scripts\activate
-3. pip install -r requirements.txt
-4. python main.py
+本机已有 .venv 时可直接运行下面的命令。首次克隆到另一台电脑时，先执行：
+  py -3.12 -m venv .venv
+  .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-三、绿色版运行方式
-将桌面上的“OCR v1.0”文件夹整体发给客户，客户解压后双击里面的
-“图像识别工具.exe”即可运行，无需安装 Python。
+model 文件夹包含识别模型，必须与源码一起保留。若依赖安装失败，先检查 Python 版本和网络连接。
 
-四、注意事项
-1. model 文件夹是识别模型，不能删除或改名。
-2. debug_preprocess 文件夹会保存每次识别的中间过程和 result.txt。
-3. 图片中有二维码时，程序会优先识别二维码并直接输出二维码内容，
-   不再进行文字识别。
+二、图形界面：单张图片识别
+在项目目录执行：
+  .\run_ocr.cmd
+
+也可执行：
+  .\.venv\Scripts\python.exe main.py
+
+界面支持“打开”“粘贴”“清空”和拖入图片。左侧“本次记录”可点选当前运行期间处理过的图片及其结果；关闭程序后记录不会保留。识别时先尝试二维码，二维码成功则直接输出二维码内容；失败时再识别文字。图形界面的调试中间图保存在 debug_preprocess 文件夹。
+
+三、终端：批量识别图片
+无需打开图形界面，在项目目录执行，例如：
+  .\run_batch.cmd ".\Test" -o ".\batch_results"
+  .\run_batch.cmd ".\图片1.png" ".\图片2.jpg" -o ".\batch_results"
+  .\run_batch.cmd ".\待识别\*.png" -o ".\batch_results"
+
+也可使用：
+  .\.venv\Scripts\python.exe batch_recognize.py ".\Test" --output ".\batch_results"
+
+可传多个图片、文件夹或通配符；文件夹会递归扫描，重复路径只处理一次。支持 PNG、JPG、JPEG、BMP、TIF、TIFF、WEBP。程序在终端逐张打印二维码或文字内容，并在末尾打印处理数量与输出路径。
+
+输出文件夹中同时生成：
+  results.jsonl：每张图片一行 JSON，包含 source、status、image_width、image_height、qr_codes、texts、error。适合程序逐行读取。
+  results.csv：每个二维码或文字结果一行，包含图片路径、类型、内容、置信度和位置；失败或未识别的图片也有一行。使用 UTF-8 BOM，方便 Excel 直接打开。
+
+status 为 ok、no_result 或 error。单张图片识别出错会记录错误并继续处理其余图片，命令最终返回非零退出码。再次使用同一输出文件夹会生成 results_002.jsonl/csv 等新文件，不覆盖旧结果。
+
+四、验证与注意事项
+运行测试：
+  .\.venv\Scripts\python.exe -m unittest discover -s tests
+
+旧版已打包的 OCR.exe 不会自动包含这里的新界面和终端功能。GitHub 仓库保存源码、模型、测试和说明；本机虚拟环境 .venv、调试目录 debug_preprocess 和批量输出 batch_results 不纳入版本控制，但仍留在本地项目文件夹。

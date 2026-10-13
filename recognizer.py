@@ -1,5 +1,8 @@
 import os
 import sys
+import hashlib
+import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -34,7 +37,23 @@ os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 
 
 def _resource_dir():
-    return _bundle_root()
+    root = _bundle_root()
+    if str(root).isascii():
+        return root
+    # Paddle and OpenCV's Windows native loaders can fail on Unicode paths.
+    cache_name = "dpmocr_models_" + hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+    cache = Path(tempfile.gettempdir()) / cache_name
+    if not str(cache).isascii():
+        raise RuntimeError("Model cache path must contain only ASCII characters")
+    source_models = root / "model"
+    for source in source_models.rglob("*"):
+        if not source.is_file():
+            continue
+        target = cache / "model" / source.relative_to(source_models)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists() or source.stat().st_size != target.stat().st_size or source.stat().st_mtime_ns != target.stat().st_mtime_ns:
+            shutil.copy2(source, target)
+    return cache
 
 
 CHAR_MODEL_PATH = str(_resource_dir() / "model" / "char_cnn" / "best_model.pdparams")
@@ -96,6 +115,7 @@ class ImageRecognizer:
         self._char_loaded = False
         self._rec6 = None
         self._wq = None
+        self._wechat_model_dir = None
         self._qrd = None
         self._det4 = None
 
@@ -107,15 +127,26 @@ class ImageRecognizer:
             import cv2
             if not hasattr(cv2, "wechat_qrcode"):
                 return
-            self._wq = cv2.wechat_qrcode_WeChatQRCode(
-                os.path.join(WECHAT_QR_MODEL_DIR, "detect.prototxt"),
-                os.path.join(WECHAT_QR_MODEL_DIR, "detect.caffemodel"),
-                os.path.join(WECHAT_QR_MODEL_DIR, "sr.prototxt"),
-                os.path.join(WECHAT_QR_MODEL_DIR, "sr.caffemodel"),
-            )
+            names = ("detect.prototxt", "detect.caffemodel", "sr.prototxt", "sr.caffemodel")
+            paths = [os.path.join(WECHAT_QR_MODEL_DIR, name) for name in names]
+            try:
+                self._wq = cv2.wechat_qrcode_WeChatQRCode(*paths)
+            except Exception:
+                # OpenCV's Windows C++ file loader may reject Unicode model paths.
+                if all(path.isascii() for path in paths):
+                    raise
+                self._wechat_model_dir = tempfile.TemporaryDirectory(prefix="dpmocr_wechat_")
+                model_dir = Path(self._wechat_model_dir.name)
+                if not str(model_dir).isascii():
+                    raise RuntimeError(f"OpenCV requires an ASCII model path: {model_dir}")
+                paths = [str(model_dir / name) for name in names]
+                for name, target in zip(names, paths):
+                    shutil.copy2(Path(WECHAT_QR_MODEL_DIR) / name, target)
+                self._wq = cv2.wechat_qrcode_WeChatQRCode(*paths)
             print("[WeChatQR] loaded")
         except Exception as e:
             print(f"[WeChatQR] Not available: {e}")
+            self._diag(f"[load_wechat_qr] {e!r}")
 
     def _load_det4(self):
         if getattr(self, "_det4", None) is not None:
@@ -602,11 +633,60 @@ class ImageRecognizer:
     def _qr_results(self, texts, points, scale):
         results = []
         for i, t in enumerate(texts):
+            if not t:
+                continue
             bbox = None
             if points is not None and i < len(points):
                 bbox = self._scale_bbox(points[i].tolist(), scale)
             results.append({"text": t, "bbox": bbox})
         return results
+
+    def _recognize_qr_near_text(self, img):
+        """Recover dot-peen QR codes using the text block as a location cue."""
+        if self._wq is None:
+            return []
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        rows = self._det_lines4(rgb)
+        if len(rows) < 2:
+            return []
+        height, width = img.shape[:2]
+        left = min(row[2] for row in rows)
+        top = min(row[0] for row in rows)
+        bottom = max(row[1] for row in rows)
+        span = bottom - top
+        if span < 30 or left < 30:
+            return []
+        side = int(span * 1.1)
+        x0, x1 = max(0, left - side), min(width, left + int(0.05 * side))
+        center = (top + bottom) / 2
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        for shift, contrast, scale in ((0.25, 8, 2), (0, 5, 3)):
+            cy = center + shift * span
+            y0, y1 = max(0, int(cy - side / 2)), min(height, int(cy + side / 2))
+            if x1 - x0 < 30 or y1 - y0 < 30:
+                continue
+            gray = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+            binary = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 31, contrast,
+            )
+            ink = cv2.dilate(255 - binary, kernel)
+            candidate = cv2.resize(
+                255 - ink, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+            )
+            try:
+                texts, points = self._wq.detectAndDecode(candidate)
+            except Exception as e:
+                self._diag(f"[qr_near_text] {e!r}")
+                continue
+            if not any(texts):
+                continue
+            results = self._qr_results(texts, points, scale)
+            for result in results:
+                if result["bbox"] is not None:
+                    result["bbox"] = [(x + x0, y + y0) for x, y in result["bbox"]]
+            return results
+        return []
 
     def recognize_qr(self, img):
         if getattr(self, "_wq", None) is None:
@@ -618,7 +698,7 @@ class ImageRecognizer:
                     texts, points = self._wq.detectAndDecode(v)
                 except Exception:
                     continue
-                if texts:
+                if any(texts):
                     return self._qr_results(texts, points, scale)
         d = self._plain_qr()
         for scale in (1, 2):
@@ -627,41 +707,18 @@ class ImageRecognizer:
                 ok, data, pts, _ = d.detectAndDecodeMulti(v)
             except Exception:
                 continue
-            if ok and data:
+            if ok and any(data):
                 return self._qr_results(data, pts, scale)
-        # 检测到四边形但未解码时，透视校正后放大再试
-        try:
-            ret, pts = d.detect(img)
-            if ret:
-                for quad in pts:
-                    q = quad.reshape(4, 2).astype(np.float32)
-                    tl = q[np.argmin(q.sum(axis=1))]
-                    br = q[np.argmax(q.sum(axis=1))]
-                    tr = q[np.argmin(q[:, 0] - q[:, 1])]
-                    bl = q[np.argmax(q[:, 0] - q[:, 1])]
-                    side = int(max(np.linalg.norm(tr - tl), np.linalg.norm(bl - tl))) + 20
-                    dst = np.array([[0, 0], [side - 1, 0], [side - 1, side - 1], [0, side - 1]], dtype=np.float32)
-                    M = cv2.getPerspectiveTransform(np.array([tl, tr, br, bl], dtype=np.float32), dst)
-                    warp = cv2.warpPerspective(img, M, (side, side))
-                    for scale in (4, 8):
-                        big = cv2.resize(warp, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                        if self._wq is not None:
-                            try:
-                                texts, _ = self._wq.detectAndDecode(big)
-                                if texts:
-                                    bbox = [(int(x), int(y)) for x, y in q.tolist()]
-                                    return [{"text": t, "bbox": bbox} for t in texts]
-                            except Exception:
-                                pass
-                        try:
-                            ok, data, dpts, _ = d.detectAndDecodeMulti(big)
-                            if ok and data:
-                                bbox = [(int(x), int(y)) for x, y in q.tolist()]
-                                return [{"text": t, "bbox": bbox} for t in data]
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+        # If whole-image decoding fails, infer a compact QR region from the text block.
+        near_text = self._recognize_qr_near_text(img)
+        if near_text:
+            return near_text
+        # Isolated color dot-peen codes may need their module lattice rebuilt.
+        from dot_peen_qr import decode_dot_peen_qr
+        recovered = decode_dot_peen_qr(img)
+        if recovered:
+            text, corners = recovered
+            return [{"text": text, "bbox": corners}]
         return []
 
     def _split(self, b):

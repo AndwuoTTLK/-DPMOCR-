@@ -2,7 +2,9 @@ paddlepaddle==3.3.1
 paddlex==3.7.2
 opencv-contrib-python==4.10.0.84
 Pillow==12.3.0
+tkinterdnd2==0.6.4
 numpy==1.26.4
+scipy==1.16.2
 pypdfium2==5.12.1
 pyclipper==1.4.0
 shapely==2.1.2

@@ -4,6 +4,7 @@ __pycache__/
 .idea/
 *.iml
 debug_preprocess/
+batch_results/
 build/
 dist/
 build_log*.txt
